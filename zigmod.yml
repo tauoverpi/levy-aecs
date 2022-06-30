@@ -1,0 +1,6 @@
+id: o2eb59cnbu5e4lfufl1ssqubbw7av1f1m7n658jdog21sgen
+name: levy-aecs
+main: src/lib.zig
+license: MIT
+description: Archetype Entity Component System
+dependencies:
