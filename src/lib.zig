@@ -270,8 +270,9 @@ pub fn Model(comptime Spec: type) type {
                         pub const Pointers = blk: {
                             var fields: [metadata.len]Type.StructField = undefined;
 
-                            for (metadata) |m, index| {
+                            const index = for (metadata) |m, index| {
                                 const C = Archetype.TypeOf(m.name.component);
+                                if (C == void) break index;
                                 fields[index] = .{
                                     .name = m.name.name(),
                                     .field_type = if (m.mutable) [*]C else [*]const C,
@@ -279,11 +280,11 @@ pub fn Model(comptime Spec: type) type {
                                     .default_value = null,
                                     .is_comptime = false,
                                 };
-                            }
+                            } else metadata.len;
 
                             break :blk @Type(.{ .Struct = .{
                                 .layout = .Auto,
-                                .fields = &fields,
+                                .fields = fields[0..index],
                                 .decls = &.{},
                                 .is_tuple = false,
                             } });
@@ -300,15 +301,17 @@ pub fn Model(comptime Spec: type) type {
                             var it = bucket.iterator();
 
                             inline for (metadata) |m| {
-                                const ptr = it.findNext(m.name.component) orelse unreachable;
-
                                 const FT = Archetype.TypeOf(m.name.component);
 
-                                const name = comptime m.name.name(); // stage 1 bug
-                                @field(result, name) = if (m.mutable)
-                                    @ptrCast([*]FT, @alignCast(@alignOf(FT), ptr))
-                                else
-                                    @ptrCast([*]const FT, @alignCast(@alignOf(FT), ptr));
+                                if (FT != void) {
+                                    const ptr = it.findNext(m.name.component) orelse unreachable;
+
+                                    const name = comptime m.name.name(); // stage 1 bug
+                                    @field(result, name) = if (m.mutable)
+                                        @ptrCast([*]FT, @alignCast(@alignOf(FT), ptr))
+                                    else
+                                        @ptrCast([*]const FT, @alignCast(@alignOf(FT), ptr));
+                                }
                             }
 
                             return result;
