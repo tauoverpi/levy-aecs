@@ -131,9 +131,9 @@ pub fn Model(comptime Spec: type) type {
                             norm[index] = .{
                                 .component = @field(Archetype.Tag, field.name),
                             };
-
-                            break :blk norm;
                         }
+
+                        break :blk norm;
                     } else {
                         break :blk namespace[0..namespace.len].*;
                     }
@@ -221,6 +221,7 @@ pub fn Model(comptime Spec: type) type {
                     return .{
                         .it = self.model.storage.iterator(),
                         .type = mask,
+                        .map = &self.model.entities,
                     };
                 }
 
@@ -264,6 +265,7 @@ pub fn Model(comptime Spec: type) type {
                     return struct {
                         type: Archetype,
                         it: BucketMap.Iterator,
+                        map: *const EntityMap,
 
                         pub const Pointers = blk: {
                             var fields: [metadata.len]Type.StructField = undefined;
@@ -289,27 +291,28 @@ pub fn Model(comptime Spec: type) type {
 
                         pub const Result = struct {
                             bucket: *Bucket,
-
-                            pub fn pointers(self: Result) Pointers {
-                                var result: Pointers = undefined;
-
-                                var it = self.bucket.iterator();
-
-                                inline for (metadata) |m| {
-                                    const ptr = it.findNext(m.name.component) orelse unreachable;
-
-                                    const FT = Archetype.TypeOf(m.name.component);
-
-                                    const name = comptime m.name.name(); // stage 1 bug
-                                    @field(result, name) = if (m.mutable)
-                                        @ptrCast([*]FT, @alignCast(@alignOf(FT), ptr))
-                                    else
-                                        @ptrCast([*]const FT, @alignCast(@alignOf(FT), ptr));
-                                }
-
-                                return result;
-                            }
+                            pointers: Pointers,
                         };
+
+                        fn pointers(bucket: *Bucket) Pointers {
+                            var result: Pointers = undefined;
+
+                            var it = bucket.iterator();
+
+                            inline for (metadata) |m| {
+                                const ptr = it.findNext(m.name.component) orelse unreachable;
+
+                                const FT = Archetype.TypeOf(m.name.component);
+
+                                const name = comptime m.name.name(); // stage 1 bug
+                                @field(result, name) = if (m.mutable)
+                                    @ptrCast([*]FT, @alignCast(@alignOf(FT), ptr))
+                                else
+                                    @ptrCast([*]const FT, @alignCast(@alignOf(FT), ptr));
+                            }
+
+                            return result;
+                        }
 
                         pub fn next(self: *@This()) ?Result {
                             var entry = self.it.next() orelse return null;
@@ -318,8 +321,11 @@ pub fn Model(comptime Spec: type) type {
                                 entry = self.it.next() orelse return null;
                             }
 
-                            entry.value_ptr.commit();
-                            return Result{ .bucket = entry.value_ptr };
+                            entry.value_ptr.commit(self.map);
+                            return Result{
+                                .bucket = entry.value_ptr,
+                                .pointers = pointers(entry.value_ptr),
+                            };
                         }
                     };
                 }
@@ -380,6 +386,7 @@ pub fn Model(comptime Spec: type) type {
 
                         if (pointer.type != .empty) {
                             const old = self.model.storage.getPtr(pointer.type) orelse unreachable;
+                            old.commit(&self.model.entities);
 
                             var old_it = old.iterator();
                             var new_it = bucket.iterator();
@@ -438,7 +445,7 @@ pub fn Model(comptime Spec: type) type {
                 return @ptrCast([*]Entity, @alignCast(@alignOf(Entity), offset))[0..self.len];
             }
 
-            pub fn items(self: Bucket, tag: Archetype.Tag) []Archetype.TypeOf(tag) {
+            pub fn items(self: Bucket, comptime tag: Archetype.Tag) []Archetype.TypeOf(tag) {
                 assert(self.type.has(tag)); // missing component
 
                 const T = Archetype.TypeOf(tag);
@@ -576,10 +583,11 @@ pub fn Model(comptime Spec: type) type {
             /// arrays (it's now sparse). To return to a compact representation see
             /// `Model.commit`.
             pub fn remove(self: *Bucket, index: u16) void {
+                assert(index < self.len); // out of bounds
                 const nodes = @ptrCast([*]Node, self.entities().ptr);
 
                 if (self.free) |*list| {
-                    assert(list.tail < index);
+                    assert(list.tail < index); // wrong order
 
                     nodes[list.tail].next = index;
                     nodes[index] = .{
@@ -608,7 +616,7 @@ pub fn Model(comptime Spec: type) type {
             /// separately to avoid having to load several locations at once
             /// leaving only the entity id array and hopefully the end
             /// of the component array in cache.
-            pub fn commit(self: *Bucket) void {
+            pub fn commit(self: *Bucket, map: *const EntityMap) void {
                 const es = self.entities();
                 const nodes = @ptrCast([*]Node, es.ptr);
                 const list = self.free orelse return;
@@ -634,7 +642,7 @@ pub fn Model(comptime Spec: type) type {
 
                         const size = layout.size[@enumToInt(pair.tag)];
                         const dst = pair.ptr + span.head * size;
-                        const src = pair.ptr + newlen * size;
+                        const src = pair.ptr + (newlen - 1) * size;
 
                         @memcpy(dst, src, size);
 
@@ -658,8 +666,15 @@ pub fn Model(comptime Spec: type) type {
                         span.tail = prev;
                     }
 
-                    const next = nodes[span.head].next;
-                    es[span.head] = es[newlen - 1];
+                    const index = span.head;
+                    const next = nodes[index].next;
+                    es[index] = es[newlen - 1];
+
+                    if (index != newlen - 1) {
+                        const pointer = map.getPtr(es[index]).?;
+                        pointer.index = index;
+                    }
+
                     span.head = next;
 
                     newlen -= 1;
@@ -736,7 +751,7 @@ pub fn Model(comptime Spec: type) type {
     };
 }
 
-test {
+test "alias" {
     const Data = struct {
         x: u32,
     };
@@ -755,7 +770,7 @@ test {
     var it = ctx.query(struct { x: u32 });
 
     while (it.next()) |result| {
-        const p = result.pointers();
+        const p = result.pointers;
         for (p.x[0..result.bucket.len]) |x| try testing.expectEqual(@as(u32, 4), x);
     }
 
@@ -764,7 +779,128 @@ test {
     var itt = otx.query(struct { foo: u32 });
 
     while (itt.next()) |result| {
-        const p = result.pointers();
+        const p = result.pointers;
         for (p.foo[0..result.bucket.len]) |x| try testing.expectEqual(@as(u32, 4), x);
+    }
+}
+
+test "migrate entities" {
+    const Data = struct {
+        x: u32,
+        y: u8,
+    };
+
+    const DB = Model(Data);
+
+    var db: DB = .{};
+    defer db.deinit(testing.allocator);
+
+    const default = db.context(&.{});
+
+    var es: [8]Entity = undefined;
+
+    for (es) |*e, index| {
+        e.* = default.new();
+        try default.update(testing.allocator, e.*, struct { x: u32 }, .{
+            .x = @intCast(u32, index + 8),
+        });
+    }
+
+    for (es[4..]) |e, index| {
+        try default.update(testing.allocator, e, struct { y: u8 }, .{
+            .y = @intCast(u8, index + 8),
+        });
+    }
+
+    var it = default.query(struct { x: u32 });
+    while (it.next()) |result| {
+        try testing.expectEqual(@as(usize, 4), result.bucket.len);
+        const p = result.pointers;
+
+        if (result.bucket.type.has(.y)) {
+            try testing.expectEqualSlices(u32, &.{ 12, 13, 14, 15 }, p.x[0..result.bucket.len]);
+            try testing.expectEqualSlices(u8, &.{ 8, 9, 10, 11 }, result.bucket.items(.y));
+        } else {
+            try testing.expectEqualSlices(u32, &.{ 8, 9, 10, 11 }, p.x[0..result.bucket.len]);
+        }
+    }
+
+    for (es) |e, index| {
+        const pointer = db.entities.get(e).?;
+        const bucket = db.storage.getPtr(pointer.type).?;
+        const value = bucket.items(.x)[pointer.index];
+        try testing.expectEqual(@intCast(u32, index + 8), value);
+
+        if (pointer.type.has(.y)) {
+            const small = bucket.items(.y)[pointer.index];
+            try testing.expectEqual(@intCast(u8, index + 4), small);
+        }
+    }
+}
+
+test "simd" {
+    const Data = struct {
+        position: Vec3 align(16),
+        velocity: Vec3 align(16),
+
+        pub const Vec3 = extern struct { x: f32, y: f32, z: f32 };
+    };
+
+    const DB = Model(Data);
+
+    var db: DB = .{};
+    defer db.deinit(testing.allocator);
+
+    const default = db.context(&.{});
+
+    var es: [32]Entity = undefined;
+
+    for (es) |*e, index| {
+        const i = 1 / @intToFloat(f32, index);
+
+        const point = .{ .x = i, .y = i, .z = i };
+
+        e.* = default.new();
+        try default.update(testing.allocator, e.*, Data, .{
+            .position = point,
+            .velocity = point,
+        });
+    }
+
+    var it = default.query(struct {
+        position: *Data.Vec3,
+        velocity: Data.Vec3,
+    });
+
+    while (it.next()) |result| {
+        const p = result.pointers;
+
+        const f32x8 = @Vector(8, f32);
+
+        var pos = @ptrCast([*]f32, p.position);
+        var vel = @ptrCast([*]const f32, p.velocity);
+        const len = result.bucket.len * 3;
+
+        var index: u16 = 0;
+        while (len - index > 8) : (index += 8) {
+            pos[0..8].* = @as(f32x8, pos[0..8].*) + @as(f32x8, vel[0..8].*);
+
+            pos += 8;
+            vel += 8;
+        }
+
+        for (vel[0 .. len - index]) |v, i| pos[i] += v;
+    }
+
+    const bucket = db.storage.getPtr(DB.Archetype.fromType(Data)).?;
+    const pos = bucket.items(.position);
+    const vel = bucket.items(.velocity);
+
+    for (pos) |p, index| {
+        const v = vel[index];
+
+        try testing.expectApproxEqAbs(p.x, v.x + v.x, 0.00001);
+        try testing.expectApproxEqAbs(p.y, v.y + v.y, 0.00001);
+        try testing.expectApproxEqAbs(p.z, v.z + v.z, 0.00001);
     }
 }
