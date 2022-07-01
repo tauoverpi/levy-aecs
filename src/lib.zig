@@ -293,6 +293,22 @@ pub fn Model(comptime Spec: type) type {
                         pub const Result = struct {
                             bucket: *Bucket,
                             pointers: Pointers,
+                            len: u16,
+
+                            const Tag = meta.FieldEnum(Pointers);
+
+                            fn Items(comptime com: Tag) type {
+                                const info = @typeInfo(meta.fieldInfo(Pointers, com).field_type).Pointer;
+                                if (info.is_const) {
+                                    return []const info.child;
+                                } else {
+                                    return []info.child;
+                                }
+                            }
+
+                            pub inline fn items(self: Result, comptime com: Tag) Items(com) {
+                                return @field(self.pointers, @tagName(com))[0..self.len];
+                            }
                         };
 
                         fn pointers(bucket: *Bucket) Pointers {
@@ -328,6 +344,7 @@ pub fn Model(comptime Spec: type) type {
                             return Result{
                                 .bucket = entry.value_ptr,
                                 .pointers = pointers(entry.value_ptr),
+                                .len = entry.value_ptr.len,
                             };
                         }
                     };
@@ -789,11 +806,10 @@ test "alias" {
 
     try ctx.update(testing.allocator, e, struct { x: u32 = 4 }, .{});
 
-    var it = ctx.query(struct { x: u32 });
+    var it = ctx.query(struct { x: *u32 });
 
     while (it.next()) |result| {
-        const p = result.pointers;
-        for (p.x[0..result.bucket.len]) |x| try testing.expectEqual(@as(u32, 4), x);
+        for (result.items(.x)) |x| try testing.expectEqual(@as(u32, 4), x);
     }
 
     const otx = db.context(&.{.{ .component = .x, .alias = .foo }});
@@ -801,8 +817,7 @@ test "alias" {
     var itt = otx.query(struct { foo: u32 });
 
     while (itt.next()) |result| {
-        const p = result.pointers;
-        for (p.foo[0..result.bucket.len]) |x| try testing.expectEqual(@as(u32, 4), x);
+        for (result.items(.foo)) |x| try testing.expectEqual(@as(u32, 4), x);
     }
 }
 
@@ -837,13 +852,12 @@ test "migrate entities" {
     var it = default.query(struct { x: u32 });
     while (it.next()) |result| {
         try testing.expectEqual(@as(usize, 4), result.bucket.len);
-        const p = result.pointers;
 
         if (result.bucket.type.has(.y)) {
-            try testing.expectEqualSlices(u32, &.{ 12, 13, 14, 15 }, p.x[0..result.bucket.len]);
+            try testing.expectEqualSlices(u32, &.{ 12, 13, 14, 15 }, result.items(.x));
             try testing.expectEqualSlices(u8, &.{ 8, 9, 10, 11 }, result.bucket.items(.y));
         } else {
-            try testing.expectEqualSlices(u32, &.{ 8, 9, 10, 11 }, p.x[0..result.bucket.len]);
+            try testing.expectEqualSlices(u32, &.{ 8, 9, 10, 11 }, result.items(.x));
         }
     }
 
