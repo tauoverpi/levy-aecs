@@ -4,14 +4,69 @@ const meta = std.meta;
 const math = std.math;
 const assert = std.debug.assert;
 const testing = std.testing;
+const comptimePrint = std.fmt.comptimePrint;
 
 const Type = std.builtin.Type;
 const Allocator = std.mem.Allocator;
 
 pub const Entity = enum(u32) { _ };
 
+fn checkDataModel(comptime T: type, comptime path: []const u8) void {
+    switch (@typeInfo(T)) {
+        .AnyFrame, .Pointer => @compileError(comptimePrint(
+            \\Pointer types cannot be stored within components: {s}: {}
+            \\
+            \\    Pointer types refer to external resources which cannot be safely serialized
+            \\    with component data. To work around this limitation, make use of a handle
+            \\    and a system which maps the handle to the given resource; e.g:
+            \\
+            \\        const Handle = enum(u32) {{ _ }};
+            \\
+            \\    The system is then responsible for managing the lifetime of the resource
+            \\    along with how to (de)serialize it.
+            \\
+        , .{ path, T })),
+
+        .Frame => @compileError(comptimePrint(
+            \\Async frames cannot be stored within components: {s}: {}
+            \\
+            \\    Async frames cannot be moved once created thus they cannot be stored within
+            \\    components which may be moved should the bucket need to be relocated to
+            \\    expand/shrink.
+            \\
+        , .{ path, T })),
+
+        .ErrorUnion => @compileError(comptimePrint(
+            \\Error unions cannot be stored within components: {s}: {}
+            \\
+            \\    Error unions are problematic as the error set values are sensitive to the
+            \\    addition of new error values within the program as they are part of a global
+            \\    set of error codes computed by the compiler thus are unlikely to hold the
+            \\    same value between changes of the program making serialization unreliable.
+            \\
+        , .{ path, T })),
+
+        .ErrorSet => @compileError(comptimePrint(
+            \\Error values cannot be stored within components: {s}: {}
+            \\
+            \\    Error sets are problematic as their values are sensitive to the addition
+            \\    of new error values within the program as they are part of a global set
+            \\    of error codes computed by the compiler thus are unlikely to hold the
+            \\    same value between changes of the program making serialization unreliable.
+            \\
+        , .{ path, T })),
+
+        .Array => |info| checkDataModel(info.child, path ++ "[_]"),
+        .Union => |info| for (info.fields) |field| checkDataModel(field.field_type, path ++ "." ++ field.name),
+        .Struct => |info| for (info.fields) |field| checkDataModel(field.field_type, path ++ "." ++ field.name),
+        .Optional => |info| checkDataModel(info.child, path ++ ".?"),
+        else => {},
+    }
+}
+
 /// Model: given a data model, construct an entity component storage type
 pub fn Model(comptime Spec: type) type {
+    comptime checkDataModel(Spec, @typeName(Spec));
     return struct {
         entities: EntityMap = .{},
         storage: BucketMap = .{},
