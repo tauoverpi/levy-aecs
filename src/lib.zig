@@ -457,11 +457,14 @@ pub fn Model(comptime Spec: type) type {
 
                 var it = self.type.iterator();
                 while (it.next()) |found| {
-                    if (found == tag) break;
-                    offset += layout.size[@enumToInt(found)];
-                }
+                    if (found == tag) {
+                        offset = mem.alignForward(offset, layout.alignment[@enumToInt(found)]);
+                        break;
+                    }
 
-                offset *= self.capacity;
+                    offset = mem.alignForward(offset, layout.alignment[@enumToInt(found)]) +
+                        layout.size[@enumToInt(found)] * self.capacity;
+                }
 
                 const ptr = @alignCast(@alignOf(T), self.bytes.ptr + offset);
 
@@ -488,6 +491,8 @@ pub fn Model(comptime Spec: type) type {
 
                 pub fn next(self: *Iterator) ?Pair {
                     const tag = self.it.next() orelse return null;
+                    self.ptr += mem.alignForward(@ptrToInt(self.ptr), layout.alignment[@enumToInt(tag)]) -
+                        @ptrToInt(self.ptr);
 
                     defer self.ptr += self.capacity * layout.size[@enumToInt(tag)];
 
@@ -529,11 +534,14 @@ pub fn Model(comptime Spec: type) type {
                 const size = blk: {
                     var size: usize = 0;
                     var it = self.type.iterator();
-                    while (it.next()) |tag| size += layout.size[@enumToInt(tag)];
+                    while (it.next()) |tag| {
+                        size = mem.alignForward(size, layout.alignment[@enumToInt(tag)]) +
+                            layout.size[@enumToInt(tag)] * new_capacity;
+                    }
                     break :blk size;
                 };
 
-                const bytes = mem.alignForward(size * new_capacity, @alignOf(Entity)) +
+                const bytes = mem.alignForward(size, @alignOf(Entity)) +
                     @sizeOf(Entity) * new_capacity;
 
                 const new_bytes = try gpa.allocBytes(alignment, bytes, 0, @returnAddress());
@@ -719,13 +727,24 @@ pub fn Model(comptime Spec: type) type {
 
             std.sort.sort(Type.StructField, &fields, {}, struct {
                 pub fn lessThan(_: void, comptime lhs: Type.StructField, comptime rhs: Type.StructField) bool {
-                    return lhs.alignment > rhs.alignment;
+                    const al = @maximum(@sizeOf(lhs.field_type), lhs.alignment);
+                    const ar = @maximum(@sizeOf(rhs.field_type), rhs.alignment);
+                    return al > ar;
                 }
             }.lessThan);
 
             for (fields) |field, index| {
-                if (@sizeOf(field.field_type) > 0) split = index;
-                alignment[index] = field.alignment;
+                if (@sizeOf(field.field_type) > 0) {
+                    alignment[index] =
+                        @maximum(@sizeOf(field.field_type), field.alignment);
+                    split = index;
+                } else {
+                    if (field.field_type != void) {
+                        @compileError("0-bit other than `void` (tags) aren't supported as component types");
+                    }
+                    alignment[index] = 0;
+                }
+
                 size[index] = @sizeOf(field.field_type);
                 set[index] = .{
                     .name = field.name,
@@ -841,7 +860,7 @@ test "migrate entities" {
     }
 }
 
-test "simd" {
+test "simd alignment" {
     const Data = struct {
         position: Vec3 align(16),
         velocity: Vec3 align(16),
@@ -883,6 +902,9 @@ test "simd" {
         var pos = @ptrCast([*]f32, p.position);
         var vel = @ptrCast([*]const f32, p.velocity);
         const len = result.bucket.len * 3;
+
+        try testing.expect(mem.alignForward(@ptrToInt(pos), 16) - @ptrToInt(pos) == 0);
+        try testing.expect(mem.alignForward(@ptrToInt(vel), 16) - @ptrToInt(vel) == 0);
 
         var index: u16 = 0;
         while (len - index > 8) : (index += 8) {
