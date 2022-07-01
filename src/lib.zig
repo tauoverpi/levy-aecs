@@ -24,7 +24,7 @@ pub fn Model(comptime Spec: type) type {
             index: u16,
         };
 
-        /// Archetype: bitset representing the currently active components
+        /// Bitset of active components.
         pub const Archetype = enum(Int) {
             empty,
             _,
@@ -78,6 +78,8 @@ pub fn Model(comptime Spec: type) type {
                 return layout.fields[@enumToInt(tag)].field_type;
             }
 
+            /// Return an iterator over currently active component tags in the
+            /// order of decending alignment.
             pub fn iterator(self: Archetype) Iterator {
                 return .{ .type = self };
             }
@@ -776,7 +778,7 @@ pub fn Model(comptime Spec: type) type {
                 .fields = &set,
                 .decls = &.{},
                 .is_exhaustive = true,
-                .tag_type = math.IntFittingRange(0, fields.len - 1),
+                .tag_type = meta.Int(.unsigned, fields.len - 1),
             } });
 
             break :blk .{
