@@ -407,7 +407,7 @@ pub fn Model(comptime Spec: type) type {
                     };
                 }
 
-                pub fn new(self: @This()) Entity {
+                fn new(self: @This()) Entity {
                     var count = self.model.count;
                     defer self.model.count = count;
 
@@ -418,6 +418,17 @@ pub fn Model(comptime Spec: type) type {
                     }
 
                     return @intToEnum(Entity, count);
+                }
+
+                pub fn create(
+                    self: @This(),
+                    gpa: Allocator,
+                    comptime T: type,
+                    value: T,
+                ) !Entity {
+                    const entity = self.new();
+                    try self.update(gpa, entity, T, value);
+                    return entity;
                 }
 
                 pub fn update(
@@ -894,8 +905,7 @@ test "migrate entities" {
     var es: [8]Entity = undefined;
 
     for (es) |*e, index| {
-        e.* = default.new();
-        try default.update(testing.allocator, e.*, struct { x: u32 }, .{
+        e.* = try default.create(testing.allocator, struct { x: u32 }, .{
             .x = @intCast(u32, index + 8),
         });
     }
@@ -953,8 +963,7 @@ test "simd alignment" {
 
         const point = .{ .x = i, .y = i, .z = i };
 
-        e.* = default.new();
-        try default.update(testing.allocator, e.*, Data, .{
+        e.* = try default.create(testing.allocator, Data, .{
             .position = point,
             .velocity = point,
         });
