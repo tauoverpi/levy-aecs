@@ -159,13 +159,13 @@ pub fn Model(comptime Spec: type) type {
         pub const Self = @This();
 
         pub const Name = struct {
-            alias: ?@TypeOf(.EnumLiteral) = null,
+            name: ?@TypeOf(.EnumLiteral) = null,
             component: Archetype.Tag,
 
-            pub fn name(comptime self: Name) []const u8 {
+            pub fn getName(comptime self: Name) []const u8 {
                 comptime {
-                    if (self.alias) |alias| {
-                        return @tagName(alias);
+                    if (self.name) |name| {
+                        return @tagName(name);
                     } else {
                         return @tagName(self.component);
                     }
@@ -218,7 +218,7 @@ pub fn Model(comptime Spec: type) type {
                     if (namespace.len == 0) {
                         return .{ .tag = @field(Archetype.Tag, field_name) };
                     } else for (namespace) |name| {
-                        if (mem.eql(u8, field_name, name.name())) {
+                        if (mem.eql(u8, field_name, name.getName())) {
                             return name;
                         }
                     } else {
@@ -227,7 +227,7 @@ pub fn Model(comptime Spec: type) type {
                         else blk: {
                             comptime var msg = "." ++ field_name ++ " is not part of the provided namespace:\n";
                             for (namespace) |name| {
-                                msg = msg ++ "\t" ++ @tagName(name.component) ++ "\t\t" ++ @tagName(name.alias) ++ "\n";
+                                msg = msg ++ "\t" ++ @tagName(name.component) ++ "\t\t" ++ @tagName(name.name) ++ "\n";
                             }
                             break :blk msg;
                         };
@@ -267,7 +267,7 @@ pub fn Model(comptime Spec: type) type {
                         var mask: Archetype = .empty;
 
                         for (namespace) |name| {
-                            if (@hasField(spec, name.name())) {
+                            if (@hasField(spec, name.getName())) {
                                 mask = mask.add(name.component);
                             }
                         }
@@ -292,8 +292,8 @@ pub fn Model(comptime Spec: type) type {
 
                         // Ensure metadata order is consistent with namespace order
                         for (namespace) |name| {
-                            if (@hasField(T, name.name())) {
-                                const field = meta.fieldInfo(T, @field(FE, name.name()));
+                            if (@hasField(T, name.getName())) {
+                                const field = meta.fieldInfo(T, @field(FE, name.getName()));
 
                                 assert(Child(field.field_type) == Archetype.TypeOf(name.component));
 
@@ -331,7 +331,7 @@ pub fn Model(comptime Spec: type) type {
                                 const C = Archetype.TypeOf(m.name.component);
                                 if (C == void) break index;
                                 fields[index] = .{
-                                    .name = m.name.name(),
+                                    .name = m.name.getName(),
                                     .field_type = if (m.mutable) [*]C else [*]const C,
                                     .alignment = @alignOf([*]C),
                                     .default_value = null,
@@ -379,7 +379,7 @@ pub fn Model(comptime Spec: type) type {
                                 if (FT != void) {
                                     const ptr = it.findNext(m.name.component) orelse unreachable;
 
-                                    const name = comptime m.name.name(); // stage 1 bug
+                                    const name = comptime m.name.getName(); // stage 1 bug
                                     @field(result, name) = if (m.mutable)
                                         @ptrCast([*]FT, @alignCast(@alignOf(FT), ptr))
                                     else
@@ -490,7 +490,7 @@ pub fn Model(comptime Spec: type) type {
                     var it = bucket.iterator();
 
                     inline for (namespace) |m| {
-                        const name = comptime m.name();
+                        const name = comptime m.getName();
                         if (@hasField(T, name)) {
                             const FT = Archetype.TypeOf(m.component);
 
@@ -869,7 +869,7 @@ test "alias" {
         for (result.items(.x)) |x| try testing.expectEqual(@as(u32, 4), x);
     }
 
-    const otx = db.context(&.{.{ .component = .x, .alias = .foo }});
+    const otx = db.context(&.{.{ .component = .x, .name = .foo }});
 
     var itt = otx.query(struct { foo: u32 });
 
