@@ -844,7 +844,7 @@ pub fn Model(comptime Spec: type) type {
                 .fields = &set,
                 .decls = &.{},
                 .is_exhaustive = true,
-                .tag_type = meta.Int(.unsigned, fields.len - 1),
+                .tag_type = math.IntFittingRange(0, fields.len - 1),
             } });
 
             break :blk .{
