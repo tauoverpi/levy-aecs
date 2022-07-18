@@ -64,7 +64,117 @@ fn checkDataModel(comptime T: type, comptime path: []const u8) void {
     }
 }
 
-/// Model: given a data model, construct an entity component storage type
+/// Construct a Database suitable for Entity Component Systems where components are stored
+/// in column major order and entities sorted into buckets based on component combinations.
+///
+/// ```
+///
+///       ,-----------,
+///       | entity id |
+///       '-----------'
+///             |
+///             v
+/// ,---------------------,
+/// | archetype | pointer |-------------------------,
+/// '---------------------'                         |
+///       |                                         |
+///       |                   Cooldown              v
+///       |                  ,--------------   --------------------,
+///       |           ,----> | c_0 | c_1 |  ...  | c_n | c_(n + 1) |
+///       |           |      '--------------   --------------------'
+///       |           |
+///       v           |       Location
+///   ,--------,      |      ,--------------   --------------------,
+///   | Bucket |------+----> | l_0 | l_1 |  ...  | l_n | l_(n + 1) |
+///   '--------'      |      '--------------   --------------------'
+///                   |
+///                   |       Destination
+///                   |      ,--------------   --------------------,
+///                   '----> | d_0 | d_1 |  ...  | d_n | d_(n + 1) |
+///                          '--------------   --------------------'
+/// ```
+///
+/// For example, given the following struct:
+///
+/// ```zig
+/// const Data = extern struct {
+///     yyyy: u32,
+///     xxxxxxxx: u64,
+///     zz0: u16
+///     w0: u8,
+///     zz1: u16,
+///     w1: u8,
+///     w2: u8,
+///     w3: u8,
+/// };
+/// ```
+///
+/// The layout will be as follows with 7 bytes of padding to ensure
+/// correct alignment of the fields.
+///
+/// ```
+///                   padding bytes
+///            ,------------------------,---------------------,
+///            |                        |                     |
+/// ,------,      ,-------------------,    ,----------------,
+/// | yyyy | //// | xxxxxxxx | zz | w | // | zz | w | w | w | /
+/// '------'      '-------------------'    '----------------'
+///     |                    |                      |
+///     '--------------------'----------------------'
+///                        data
+/// ```
+///
+/// To work around the memory wasted on padding, fields are sorted by
+/// alignment such that the field with the largest alignment requirements
+/// is placed first (assumed to be the largest type) with all other fields
+/// following in decending order.
+///
+/// ```
+/// ,-------------------------------------------,
+/// | xxxxxxxx | yyyy | zz | zz | w | w | w | w | //// :( some padding remains
+/// '-------------------------------------------'
+/// ```
+///
+/// To eliminate padding where possible, after sorting fields by alignment,
+/// each field is turned into an array with the length equal to the capacity
+/// of the bucket (this is known as _Structure of Arrays_ or _SoA_).
+///
+/// ```zig
+/// const Storage = extern struct {
+///    xxxxxxxx: [_]u64,
+///    yyyy: [_]u32,
+///    zz0: [_]u16,
+///    zz1: [_]u16,
+///    w0: [_]u8,
+///    w1: [_]u8,
+///    w2: [_]u8,
+///    w3: [_]u8,
+/// }
+/// ```
+///
+/// There is still the chance that some padding remains in cases where the alignment
+/// of a value doesn't match it's size. Thus given the following data model:
+///
+/// ```
+/// const Data = extern struct {
+///     yyyy: u32 align(8),
+///     zz: u16 align(8),
+/// };
+/// ```
+///
+/// Whenever the end of a component array would end up on an address with a lower
+/// alignment than required by the component array which follows, padding is
+/// inserted between.
+///
+/// ```
+///        padding due to 8 byte alignment of zz
+///                          |
+/// ,--------------------,      ,--------------,
+/// | yyyy | yyyy | yyyy | //// | zz | zz | zz |
+/// '--------------------'      '--------------'
+/// ```
+///
+/// There isn't anything which can be done about this thus the gap remains unused.
 pub fn Model(comptime Spec: type) type {
     comptime checkDataModel(Spec, @typeName(Spec));
     return struct {
@@ -72,10 +182,16 @@ pub fn Model(comptime Spec: type) type {
         storage: BucketMap = .{},
         count: u32 = 0,
 
+        /// Data model given
+        pub const Data = Spec;
+
         pub const EntityMap = std.AutoHashMapUnmanaged(Entity, Pointer);
         pub const BucketMap = std.AutoHashMapUnmanaged(Archetype, Bucket);
+
         pub const Pointer = struct {
+            /// Key to the bucket which the entity resides within.
             type: Archetype,
+            /// Location of the entity within the bucket.
             index: u16,
         };
 
@@ -89,26 +205,32 @@ pub fn Model(comptime Spec: type) type {
             pub const Tag = layout.tag;
             pub const void_mask = @intToEnum(Archetype, ~((@as(Int, 1) << layout.split) - 1));
 
+            /// Produce a new archetype with the given component set.
             pub fn add(self: Archetype, tag: Tag) Archetype {
                 return @intToEnum(Archetype, @enumToInt(self) | (@as(Int, 1) << @enumToInt(tag)));
             }
 
+            /// Produce a new archetype without the given component.
             pub fn remove(self: Archetype, tag: Tag) Archetype {
                 return @intToEnum(Archetype, @enumToInt(self) & ~(@as(Int, 1) << @enumToInt(tag)));
             }
 
+            /// Test if the archetype has a given component bit set.
             pub fn has(self: Archetype, tag: Tag) bool {
                 return @enumToInt(self) & (@as(Int, 1) << @enumToInt(tag)) != 0;
             }
 
+            /// Merge two archetype bitsets.
             pub fn merge(self: Archetype, other: Archetype) Archetype {
                 return @intToEnum(Archetype, @enumToInt(self) | @enumToInt(other));
             }
 
+            /// Test if the given archetype is a superset of the other.
             pub fn contains(self: Archetype, other: Archetype) bool {
                 return @enumToInt(self) & @enumToInt(other) == @enumToInt(other);
             }
 
+            /// Create an archetype from a slice of component tags.
             pub fn fromList(tags: []const Tag) Archetype {
                 var tmp: Archetype = .empty;
 
@@ -117,11 +239,14 @@ pub fn Model(comptime Spec: type) type {
                 return tmp;
             }
 
+            /// Create an archetype from field names within a given struct type.
             pub fn fromType(comptime T: type) Archetype {
                 comptime {
+                    const info = @typeInfo(T).Struct;
+
                     var tmp: Archetype = .empty;
 
-                    for (meta.fields(T)) |field| {
+                    for (info.fields) |field| {
                         tmp = tmp.add(@field(Tag, field.name));
                     }
 
@@ -129,6 +254,7 @@ pub fn Model(comptime Spec: type) type {
                 }
             }
 
+            /// Get the type of a component value given the component tag.
             pub fn TypeOf(comptime tag: Tag) type {
                 return layout.fields[@enumToInt(tag)].field_type;
             }
@@ -142,6 +268,7 @@ pub fn Model(comptime Spec: type) type {
             pub const Iterator = struct {
                 type: Archetype,
 
+                /// Return the next component tag present within the archetype.
                 pub fn next(self: *Iterator) ?Tag {
                     const int = @enumToInt(self.type);
 
@@ -173,11 +300,12 @@ pub fn Model(comptime Spec: type) type {
             }
         };
 
+        /// Return a context with the given namespace.
         pub fn context(self: *Self, comptime namespace: []const Name) Context(namespace) {
             return .{ .model = self };
         }
 
-        /// Generate a context in which component names are remapped
+        /// Generate a context in which component names are remapped.
         pub fn Context(comptime namespace: []const Name) type {
             comptime {
                 var norm = blk: {
@@ -262,6 +390,18 @@ pub fn Model(comptime Spec: type) type {
                     }
                 }
 
+                /// Construct a query iterator over the given component specification.
+                /// The query specification given as a struct type where field names map
+                /// to component names.
+                ///
+                /// ```
+                /// var it = context.query(struct {
+                ///     copy: T,
+                ///     mutable: *T,
+                /// });
+                /// ```
+                ///
+                /// Note: the order of traversal is undefined thus shouldn't be relied upon.
                 pub fn query(self: @This(), comptime spec: type) Query(spec) {
                     const mask = comptime blk: {
                         var mask: Archetype = .empty;
@@ -420,6 +560,7 @@ pub fn Model(comptime Spec: type) type {
                     return @intToEnum(Entity, count);
                 }
 
+                /// Create a new entity with the given components.
                 pub fn create(
                     self: @This(),
                     gpa: Allocator,
@@ -647,9 +788,9 @@ pub fn Model(comptime Spec: type) type {
 
                 while (self_it.next()) |self_pair| {
                     const new_pair = new_it.next() orelse unreachable;
-                    const len = layout.size[@enumToInt(self_pair.tag)];
+                    const len = layout.size[@enumToInt(self_pair.tag)] * self.len;
 
-                    @memcpy(new_pair.ptr, self_pair.ptr, len * self.len);
+                    @memcpy(new_pair.ptr, self_pair.ptr, len);
                 }
 
                 mem.copy(Entity, bucket.entities(), self.entities());
