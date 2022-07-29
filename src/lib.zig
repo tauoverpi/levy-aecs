@@ -2,900 +2,575 @@ const std = @import("std");
 const mem = std.mem;
 const meta = std.meta;
 const math = std.math;
-const assert = std.debug.assert;
 const testing = std.testing;
-const comptimePrint = std.fmt.comptimePrint;
+const assert = std.debug.assert;
+const todo = std.debug.todo;
 
 const Type = std.builtin.Type;
 const Allocator = std.mem.Allocator;
 
-pub const Entity = enum(u32) { _ };
+fn Decompose(comptime Data: type) type {
+    comptime {
+        const tmp = meta.fields(Data);
+        var fields = tmp[0..tmp.len].*;
+        var alignment: [fields.len]u8 = undefined;
+        var size: [fields.len]u8 = undefined;
+        var set: [fields.len]Type.EnumField = undefined;
+        var split: usize = 0;
 
-fn checkDataModel(comptime T: type, comptime path: []const u8) void {
-    switch (@typeInfo(T)) {
-        .AnyFrame, .Pointer => @compileError(comptimePrint(
-            \\Pointer types cannot be stored within components: {s}: {}
-            \\
-            \\    Pointer types refer to external resources which cannot be safely serialized
-            \\    with component data. To work around this limitation, make use of a handle
-            \\    and a system which maps the handle to the given resource; e.g:
-            \\
-            \\        const Handle = enum(u32) {{ _ }};
-            \\
-            \\    The system is then responsible for managing the lifetime of the resource
-            \\    along with how to (de)serialize it.
-            \\
-        , .{ path, T })),
+        std.sort.sort(Type.StructField, &fields, {}, struct {
+            pub fn lessThan(_: void, comptime lhs: Type.StructField, comptime rhs: Type.StructField) bool {
+                const al = @maximum(@sizeOf(lhs.field_type), lhs.alignment);
+                const ar = @maximum(@sizeOf(rhs.field_type), rhs.alignment);
+                return al > ar;
+            }
+        }.lessThan);
 
-        .Frame => @compileError(comptimePrint(
-            \\Async frames cannot be stored within components: {s}: {}
-            \\
-            \\    Async frames cannot be moved once created thus they cannot be stored within
-            \\    components which may be moved should the bucket need to be relocated to
-            \\    expand/shrink.
-            \\
-        , .{ path, T })),
+        for (fields) |field, index| {
+            if (@sizeOf(field.field_type) > 0) {
+                alignment[index] = field.alignment;
+                split = index;
+            } else {
+                alignment[index] = 0;
+            }
 
-        .ErrorUnion => @compileError(comptimePrint(
-            \\Error unions cannot be stored within components: {s}: {}
-            \\
-            \\    Error unions are problematic as the error set values are sensitive to the
-            \\    addition of new error values within the program as they are part of a global
-            \\    set of error codes computed by the compiler thus are unlikely to hold the
-            \\    same value between changes of the program making serialization unreliable.
-            \\
-        , .{ path, T })),
+            size[index] = @sizeOf(field.field_type);
+            set[index] = .{
+                .name = field.name,
+                .value = index,
+            };
+        }
 
-        .ErrorSet => @compileError(comptimePrint(
-            \\Error values cannot be stored within components: {s}: {}
-            \\
-            \\    Error sets are problematic as their values are sensitive to the addition
-            \\    of new error values within the program as they are part of a global set
-            \\    of error codes computed by the compiler thus are unlikely to hold the
-            \\    same value between changes of the program making serialization unreliable.
-            \\
-        , .{ path, T })),
+        const tag = @Type(.{ .Enum = .{
+            .layout = .Auto,
+            .fields = &set,
+            .decls = &.{},
+            .is_exhaustive = true,
+            .tag_type = math.IntFittingRange(0, fields.len - 1),
+        } });
 
-        .Array => |info| checkDataModel(info.child, path ++ "[_]"),
-        .Union => |info| for (info.fields) |field| checkDataModel(field.field_type, path ++ "." ++ field.name),
-        .Struct => |info| for (info.fields) |field| checkDataModel(field.field_type, path ++ "." ++ field.name),
-        .Optional => |info| checkDataModel(info.child, path ++ ".?"),
-        else => {},
+        return struct {
+            pub const fields = fields;
+            pub const alignment = alignment;
+            pub const size = size;
+            pub const tag = tag;
+            pub const split = @as(comptime_int, split);
+        };
     }
 }
 
-/// Construct a Database suitable for Entity Component Systems where components are stored
-/// in column major order and entities sorted into buckets based on component combinations.
-///
-/// ```
-///
-///       ,-----------,
-///       | entity id |
-///       '-----------'
-///             |
-///             v
-/// ,---------------------,
-/// | archetype | pointer |-------------------------,
-/// '---------------------'                         |
-///       |                                         |
-///       |                   Cooldown              v
-///       |                  ,--------------   --------------------,
-///       |           ,----> | c_0 | c_1 |  ...  | c_n | c_(n + 1) |
-///       |           |      '--------------   --------------------'
-///       |           |
-///       v           |       Location
-///   ,--------,      |      ,--------------   --------------------,
-///   | Bucket |------+----> | l_0 | l_1 |  ...  | l_n | l_(n + 1) |
-///   '--------'      |      '--------------   --------------------'
-///                   |
-///                   |       Destination
-///                   |      ,--------------   --------------------,
-///                   '----> | d_0 | d_1 |  ...  | d_n | d_(n + 1) |
-///                          '--------------   --------------------'
-/// ```
-///
-/// For example, given the following struct:
-///
-/// ```zig
-/// const Data = extern struct {
-///     yyyy: u32,
-///     xxxxxxxx: u64,
-///     zz0: u16
-///     w0: u8,
-///     zz1: u16,
-///     w1: u8,
-///     w2: u8,
-///     w3: u8,
-/// };
-/// ```
-///
-/// The layout will be as follows with 7 bytes of padding to ensure
-/// correct alignment of the fields.
-///
-/// ```
-///                   padding bytes
-///            ,------------------------,---------------------,
-///            |                        |                     |
-/// ,------,      ,-------------------,    ,----------------,
-/// | yyyy | //// | xxxxxxxx | zz | w | // | zz | w | w | w | /
-/// '------'      '-------------------'    '----------------'
-///     |                    |                      |
-///     '--------------------'----------------------'
-///                        data
-/// ```
-///
-/// To work around the memory wasted on padding, fields are sorted by
-/// alignment such that the field with the largest alignment requirements
-/// is placed first (assumed to be the largest type) with all other fields
-/// following in decending order.
-///
-/// ```
-/// ,-------------------------------------------,
-/// | xxxxxxxx | yyyy | zz | zz | w | w | w | w | //// :( some padding remains
-/// '-------------------------------------------'
-/// ```
-///
-/// To eliminate padding where possible, after sorting fields by alignment,
-/// each field is turned into an array with the length equal to the capacity
-/// of the bucket (this is known as _Structure of Arrays_ or _SoA_).
-///
-/// ```zig
-/// const Storage = extern struct {
-///    xxxxxxxx: [_]u64,
-///    yyyy: [_]u32,
-///    zz0: [_]u16,
-///    zz1: [_]u16,
-///    w0: [_]u8,
-///    w1: [_]u8,
-///    w2: [_]u8,
-///    w3: [_]u8,
-/// }
-/// ```
-///
-/// There is still the chance that some padding remains in cases where the alignment
-/// of a value doesn't match it's size. Thus given the following data model:
-///
-/// ```
-/// const Data = extern struct {
-///     yyyy: u32 align(8),
-///     zz: u16 align(8),
-/// };
-/// ```
-///
-/// Whenever the end of a component array would end up on an address with a lower
-/// alignment than required by the component array which follows, padding is
-/// inserted between.
-///
-/// ```
-///        padding due to 8 byte alignment of zz
-///                          |
-/// ,--------------------,      ,--------------,
-/// | yyyy | yyyy | yyyy | //// | zz | zz | zz |
-/// '--------------------'      '--------------'
-/// ```
-///
-/// There isn't anything which can be done about this thus the gap remains unused.
-pub fn Model(comptime Spec: type) type {
-    comptime checkDataModel(Spec, @typeName(Spec));
+/// Entity identifier
+pub const Entity = enum(u32) { _ };
+
+pub fn Archetype(comptime Data: type) type {
+    const layout = Decompose(Data);
     return struct {
-        entities: EntityMap = .{},
-        storage: BucketMap = .{},
-        count: u32 = 0,
+        bitset: Set = empty,
 
-        /// Data model given
-        pub const Data = Spec;
+        pub const Set = [slots]u32;
+        pub const Int = u32;
+        pub const Shift = u5;
+        pub const empty = mem.zeroes(Set);
 
-        pub const EntityMap = std.AutoHashMapUnmanaged(Entity, Pointer);
-        pub const BucketMap = std.AutoHashMapUnmanaged(Archetype, Bucket);
+        const slots = @maximum(1, layout.fields.len >> 5);
 
-        pub const Pointer = struct {
-            /// Key to the bucket which the entity resides within.
-            type: Archetype,
-            /// Location of the entity within the bucket.
-            index: u16,
-        };
+        pub const Tag = layout.tag;
+        const Self = @This();
 
-        /// Bitset of active components.
-        pub const Archetype = enum(Int) {
-            empty,
-            _,
+        fn bit(tag: Tag) u32 {
+            return @as(Int, 1) << @truncate(Shift, @as(u32, @enumToInt(tag)));
+        }
 
-            /// Backing integer for the bitset
-            pub const Int = meta.Int(.unsigned, layout.fields.len);
-            pub const Tag = layout.tag;
-            pub const void_mask = @intToEnum(Archetype, ~((@as(Int, 1) << layout.split) - 1));
+        fn slot(tag: Tag) u32 {
+            return @as(u32, @enumToInt(tag)) >> @bitSizeOf(Shift);
+        }
 
-            /// Produce a new archetype with the given component set.
-            pub fn add(self: Archetype, tag: Tag) Archetype {
-                return @intToEnum(Archetype, @enumToInt(self) | (@as(Int, 1) << @enumToInt(tag)));
+        // TODO: check that this works correctly with result location semantics
+
+        /// Produce a new archetype with the given component set.
+        pub fn add(self: Self, tag: Tag) Self {
+            var set = self;
+
+            set.bitset[slot(tag)] |= bit(tag);
+
+            return set;
+        }
+
+        /// Produce a new archetype without the given component.
+        pub fn remove(self: Self, tag: Tag) Self {
+            var set = self;
+
+            set.bitset[slot(tag)] &= ~bit(tag);
+
+            return set;
+        }
+
+        /// Test if the archetype has a given component bit set.
+        pub fn has(self: Self, tag: Tag) bool {
+            return self.bitset[slot(tag)] & bit(tag) == bit(tag);
+        }
+
+        /// Merge two archetype bitsets.
+        pub fn merge(self: Self, other: Self) Self {
+            var set = self;
+            for (other.bitset) |cell, i| {
+                set.bitset[i] |= cell;
             }
 
-            /// Produce a new archetype without the given component.
-            pub fn remove(self: Archetype, tag: Tag) Archetype {
-                return @intToEnum(Archetype, @enumToInt(self) & ~(@as(Int, 1) << @enumToInt(tag)));
+            return set;
+        }
+
+        /// Test if the given archetype is a superset of the other.
+        pub fn contains(self: Self, other: Self) bool {
+            for (other.bitset) |cell, i| {
+                if (self.bitset[i] & cell != cell) return false;
             }
 
-            /// Test if the archetype has a given component bit set.
-            pub fn has(self: Archetype, tag: Tag) bool {
-                return @enumToInt(self) & (@as(Int, 1) << @enumToInt(tag)) != 0;
-            }
+            return true;
+        }
 
-            /// Merge two archetype bitsets.
-            pub fn merge(self: Archetype, other: Archetype) Archetype {
-                return @intToEnum(Archetype, @enumToInt(self) | @enumToInt(other));
-            }
+        /// Create an archetype from a slice of component tags.
+        pub fn fromList(tags: []const Tag) Self {
+            var tmp: Self = .{};
 
-            /// Test if the given archetype is a superset of the other.
-            pub fn contains(self: Archetype, other: Archetype) bool {
-                return @enumToInt(self) & @enumToInt(other) == @enumToInt(other);
-            }
+            for (tags) |tag| tmp = tmp.add(tag);
 
-            /// Create an archetype from a slice of component tags.
-            pub fn fromList(tags: []const Tag) Archetype {
-                var tmp: Archetype = .empty;
+            return tmp;
+        }
 
-                for (tags) |tag| tmp = tmp.add(tag);
+        /// Create an archetype from field names within a given struct type.
+        pub inline fn fromType(comptime T: type) Self {
+            comptime {
+                const info = @typeInfo(T).Struct;
+
+                var tmp: Self = .{};
+
+                for (info.fields) |field| {
+                    tmp = tmp.add(@field(Tag, field.name));
+                }
 
                 return tmp;
             }
+        }
 
-            /// Create an archetype from field names within a given struct type.
-            pub fn fromType(comptime T: type) Archetype {
-                comptime {
-                    const info = @typeInfo(T).Struct;
+        /// Get the type of a component value given the component tag.
+        pub fn TypeOf(comptime tag: Tag) type {
+            return layout.fields[@enumToInt(tag)].field_type;
+        }
 
-                    var tmp: Archetype = .empty;
+        /// Return an iterator over currently active component tags in the
+        /// order of decending alignment.
+        pub fn iterator(self: *const Self) Iterator {
+            return .{ .type = self };
+        }
 
-                    for (info.fields) |field| {
-                        tmp = tmp.add(@field(Tag, field.name));
+        pub const Iterator = struct {
+            type: *const Self,
+            offset: u4 = 0,
+            mask: u32 = 0,
+
+            /// Return the next component tag present within the archetype.
+            pub fn next(self: *Iterator) ?Tag {
+                for (self.type.bitset[self.offset..]) |cell| {
+                    const int = @ctz(u32, cell & ~self.mask);
+                    if (int != 32) {
+                        const index = @shlExact(@as(u32, 1), @intCast(Shift, int));
+                        self.mask |= index;
+                        const bits = @intCast(meta.Tag(Tag), 32 * @as(u32, self.offset));
+                        const tag = @intToEnum(Tag, int + bits);
+                        return tag;
                     }
 
-                    return tmp;
+                    self.mask = 0;
+                    self.offset += 1;
                 }
-            }
 
-            /// Get the type of a component value given the component tag.
-            pub fn TypeOf(comptime tag: Tag) type {
-                return layout.fields[@enumToInt(tag)].field_type;
-            }
-
-            /// Return an iterator over currently active component tags in the
-            /// order of decending alignment.
-            pub fn iterator(self: Archetype) Iterator {
-                return .{ .type = self };
-            }
-
-            pub const Iterator = struct {
-                type: Archetype,
-
-                /// Return the next component tag present within the archetype.
-                pub fn next(self: *Iterator) ?Tag {
-                    const int = @enumToInt(self.type);
-
-                    if (int == 0) return null;
-
-                    const tag = @intToEnum(Tag, @ctz(Int, int));
-
-                    self.type = self.type.remove(tag);
-
-                    return tag;
-                }
-            };
-        };
-
-        pub const Self = @This();
-
-        pub const Name = struct {
-            name: ?@TypeOf(.EnumLiteral) = null,
-            component: Archetype.Tag,
-
-            pub fn getName(comptime self: Name) []const u8 {
-                comptime {
-                    if (self.name) |name| {
-                        return @tagName(name);
-                    } else {
-                        return @tagName(self.component);
-                    }
-                }
+                return null;
             }
         };
 
-        /// Return a context with the given namespace.
-        pub fn context(self: *Self, comptime namespace: []const Name) Context(namespace) {
-            return .{ .model = self };
+        pub fn backwardIterator(self: *const Self) BackwardIterator {
+            return .{ .type = self };
         }
 
-        /// Generate a context in which component names are remapped.
-        pub fn Context(comptime namespace: []const Name) type {
-            comptime {
-                var norm = blk: {
-                    if (namespace.len == 0) {
-                        var norm: [layout.fields.len]Name = undefined;
+        pub const BackwardIterator = struct {
+            type: *const Self,
+            offset: u4 = slots - 1,
+            mask: u32 = 0,
 
-                        for (layout.fields) |field, index| {
-                            norm[index] = .{
-                                .component = @field(Archetype.Tag, field.name),
-                            };
-                        }
-
-                        break :blk norm;
-                    } else {
-                        break :blk namespace[0..namespace.len].*;
+            pub fn next(self: *BackwardIterator) ?Tag {
+                const len = self.type.bitset.len - 1;
+                while (true) {
+                    const cell = @clz(u32, self.type.bitset[len - self.offset] & ~self.mask);
+                    if (cell != 32) {
+                        const int = @intCast(Shift, 31 - cell);
+                        const index = @shlExact(@as(u32, 1), int);
+                        self.mask |= index;
+                        const bits = @intCast(meta.Tag(Tag), 32 * @as(u32, self.offset));
+                        const tag = @intToEnum(Tag, int + bits);
+                        return tag;
                     }
-                };
 
-                std.sort.sort(Name, &norm, {}, struct {
-                    pub fn lessThan(_: void, comptime lhs: Name, comptime rhs: Name) bool {
-                        return @enumToInt(lhs.component) < @enumToInt(rhs.component);
-                    }
-                }.lessThan);
+                    if (self.offset == 0) return null;
 
-                return ContextImpl(norm.len, norm);
+                    self.mask = 0;
+                    self.offset -= 1;
+                }
+            }
+        };
+    };
+}
+
+test "Archetype iterators" {
+    const Data = struct { x: u32, y: f32, z: u8, w: u128 };
+
+    const a = Archetype(Data);
+    const b = Archetype(Data);
+    comptime assert(a == b);
+
+    const T = Archetype(Data);
+    const archetype = T.fromType(Data);
+
+    var it = archetype.iterator();
+    for ([_]T.Tag{ .w, .x, .y, .z }) |tag| {
+        const found = it.next() orelse return error.Unexpected;
+
+        try testing.expectEqual(tag, found);
+    }
+
+    var bi = archetype.backwardIterator();
+    for ([_]T.Tag{ .z, .y, .x, .w }) |tag| {
+        const found = bi.next().?;
+
+        try testing.expectEqual(tag, found);
+    }
+}
+
+pub fn BucketUnmanaged(comptime Data: type) type {
+    return struct {
+        bucket: Bucket(Data),
+        const Self = @This();
+
+        pub fn entities(self: *Self) []Entity {
+            return self.bucket.entities();
+        }
+
+        pub fn setCapacity(self: *Self, gpa: Allocator, new_capacity: u16) !void {
+            const alignment = self.bucket.alignment();
+            const bytes = self.bucket.bytesOf(new_capacity);
+
+            if (gpa.resize(self.bytes, bytes)) |new_bytes| {
+                var new = self.*;
+                new.bytes = new_bytes;
+                new.capacity = new_capacity;
+                self.copyBackwardsTo(new);
+                return;
+            }
+
+            const new_bytes = try gpa.allocBytes(alignment, bytes, 0, @returnAddress());
+
+            if (self.len == 0) {
+                gpa.free(self.bytes);
+                self.bytes = new_bytes;
+                self.capacity = new_capacity;
+                return;
+            }
+
+            var new = self.*;
+            new.bytes = new_bytes;
+            new.capacity = new_capacity;
+
+            self.copyTo(new);
+            gpa.free(self.bytes);
+
+            self.* = new;
+        }
+
+        pub fn deinit(self: *Self, gpa: Allocator) void {
+            gpa.free(self.bucket.bytes);
+            self.* = .{};
+        }
+    };
+}
+
+pub fn Bucket(comptime Data: type) type {
+    const layout = Decompose(Data);
+    const natural_alignment = blk: {
+        var tmp = true;
+        for (layout.size) |size, index| {
+            tmp = size == layout.alignment[index] and tmp;
+        }
+
+        break :blk tmp;
+    };
+    return struct {
+        type: Archetype(Data),
+        capacity: u16 = 0,
+        bytes: []u8 = &.{},
+        free: Free = .{},
+        len: u16 = 0,
+
+        const Self = @This();
+
+        pub fn entities(self: Self) []Entity {
+            const offset = self.bytes.ptr + (self.bytes.len - @sizeOf(Entity) * self.capacity);
+            return @ptrCast([*]Entity, @alignCast(@alignOf(Entity), offset))[0..self.len];
+        }
+
+        pub fn alignment(archetype: Archetype(Data)) u29 {
+            var it = archetype.iterator();
+            const first = it.next() orelse return @alignOf(Entity);
+            return layout.alignment[@enumToInt(first)];
+        }
+
+        pub fn sizeOf(archetype: Archetype(Data), new_capacity: u16) usize {
+            var size: usize = 0;
+
+            var it = archetype.iterator();
+            while (it.next()) |tag| {
+                const al = layout.alignment[@enumToInt(tag)];
+                size = mem.alignForward(size, al) +
+                    layout.size[@enumToInt(tag)] * new_capacity;
+            }
+
+            return mem.alignForward(size, @alignOf(Entity)) + @sizeOf(Entity) * new_capacity;
+        }
+
+        pub fn push(self: *Self, entries: u16) error{Capacity}!u16 {
+            if (@as(u32, self.len) + entries > self.capacity) return error.Capacity;
+            defer self.len += 1;
+            return self.len;
+        }
+
+        pub fn copyTo(self: Self, other: Self) void {
+            assert(self.type == other.type);
+            assert(self.bytes.len <= other.bytes.len);
+
+            var si = self.iterator();
+            var oi = other.iterator();
+
+            mem.copy(Entity, other.entities(), self.entities());
+
+            while (si.next()) |src| {
+                const dst = oi.findNext(src.tag);
+                const len = @as(usize, layout.size[@enumToInt(src.tag)]) * self.len;
+
+                @memcpy(dst.ptr, src.ptr, len);
             }
         }
 
-        // ContextImpl is split into a separate function rather than inlining it
-        // such that an equivalent namespace which only differs in the order in
-        // which aliases are specified yield the same result.
-        fn ContextImpl(comptime namespace_len: usize, comptime namespace: [namespace_len]Name) type {
-            return struct {
-                model: *Self,
+        pub fn items(self: Self, comptime tag: Archetype(Data).Tag) []Archetype(Data).TypeOf(tag) {
+            return @ptrCast(
+                [*]Archetype(Data).TypeOf(tag),
+                self.iterator().findNext(tag).?.ptr,
+            )[0..self.capacity];
+        }
 
-                /// Find the appropriate name within the namespace for the given item
-                fn getName(comptime field_name: []const u8) Name {
-                    if (namespace.len == 0) {
-                        return .{ .tag = @field(Archetype.Tag, field_name) };
-                    } else for (namespace) |name| {
-                        if (mem.eql(u8, field_name, name.getName())) {
-                            return name;
-                        }
-                    } else {
-                        const msg = if (namespace.len == 0)
-                            "." ++ field_name ++ " is not part of the declared components"
-                        else blk: {
-                            comptime var msg = "." ++ field_name ++ " is not part of the provided namespace:\n";
-                            for (namespace) |name| {
-                                msg = msg ++ "\t" ++ @tagName(name.component) ++ "\t\t" ++ @tagName(name.name) ++ "\n";
-                            }
-                            break :blk msg;
-                        };
+        /// Move an entity from the current bucket to anoher.
+        ///
+        /// note: the source bucket is left sparse after moving the entity thus a call
+        ///       to `.commit` needs to be issued before iterating over the contents.
+        pub fn move(self: *Self, dst_index: u16, other: Self, src_index: u16) void {
+            var si = self.iterator();
+            var oi = other.iterator();
 
-                        @compileError(msg);
-                    }
-                }
+            while (si.next()) |src| {
+                const dst = oi.findNext(src.tag).?;
+                const size: usize = layout.size[@enumToInt(src.tag)];
+                @memcpy(dst.ptr + dst_index * size, src.ptr + src_index * size, size);
+            }
 
-                const Metadata = struct {
-                    name: Name,
-                    mutable: bool,
-                };
+            other.entities()[dst_index] = self.entities()[src_index];
+            self.remove(src_index);
+        }
 
-                fn isMutablePointer(comptime T: type) bool {
-                    switch (@typeInfo(T)) {
-                        .Pointer => |info| switch (info.size) {
-                            .One => if (!info.is_const) {
-                                return true;
-                            } else @compileError(
-                                "`*const T` provided, `T` is preferred as it maps to the same pointer type",
-                            ),
-                            else => @compileError("query only supports single item pointers (*T)"),
-                        },
-                        else => return false,
-                    }
-                }
-
-                fn Child(comptime T: type) type {
-                    switch (@typeInfo(T)) {
-                        .Pointer => |info| return info.child,
-                        else => return T,
-                    }
-                }
-
-                /// Construct a query iterator over the given component specification.
-                /// The query specification given as a struct type where field names map
-                /// to component names.
-                ///
-                /// ```
-                /// var it = context.query(struct {
-                ///     copy: T,
-                ///     mutable: *T,
-                /// });
-                /// ```
-                ///
-                /// Note: the order of traversal is undefined thus shouldn't be relied upon.
-                pub fn query(self: @This(), comptime spec: type) Query(spec) {
-                    const mask = comptime blk: {
-                        var mask: Archetype = .empty;
-
-                        for (namespace) |name| {
-                            if (@hasField(spec, name.getName())) {
-                                mask = mask.add(name.component);
-                            }
-                        }
-
-                        break :blk mask;
-                    };
-
-                    return .{
-                        .it = self.model.storage.iterator(),
-                        .type = mask,
-                        .map = &self.model.entities,
-                    };
-                }
-
-                pub fn Query(comptime T: type) type {
-                    comptime {
-                        const FE = meta.FieldEnum(T);
-
-                        var metadata: [meta.fields(T).len]Metadata = undefined;
-
-                        var index: usize = 0;
-
-                        // Ensure metadata order is consistent with namespace order
-                        for (namespace) |name| {
-                            if (@hasField(T, name.getName())) {
-                                const field = meta.fieldInfo(T, @field(FE, name.getName()));
-
-                                assert(Child(field.field_type) == Archetype.TypeOf(name.component));
-
-                                metadata[index] = .{
-                                    .name = name,
-                                    .mutable = isMutablePointer(field.field_type),
-                                };
-
-                                index += 1;
-                            }
-                        }
-
-                        assert(index == metadata.len); // missing fields
-
-                        return QueryImpl(metadata.len, metadata);
-                    }
-                }
-
-                /// QueryImpl is split into a separate function to reduce the number of instantiations
-                /// required as zig uses nominal rather than structural types leading to new types for
-                /// each struct given even if it has the exact same set of fields as one specified prior
-                /// with the same context. Thus, inspecting just the structure of the given type and
-                /// ignoring the uniqueness of it reduces the number of variations of metadata and takes
-                /// advantage of lazy evaluation present in zig comptime.
-                fn QueryImpl(comptime metadata_len: usize, comptime metadata: [metadata_len]Metadata) type {
-                    return struct {
-                        type: Archetype,
-                        it: BucketMap.Iterator,
-                        map: *const EntityMap,
-
-                        pub const Pointers = blk: {
-                            var fields: [metadata.len]Type.StructField = undefined;
-
-                            const index = for (metadata) |m, index| {
-                                const C = Archetype.TypeOf(m.name.component);
-                                if (C == void) break index;
-                                fields[index] = .{
-                                    .name = m.name.getName(),
-                                    .field_type = if (m.mutable) [*]C else [*]const C,
-                                    .alignment = @alignOf([*]C),
-                                    .default_value = null,
-                                    .is_comptime = false,
-                                };
-                            } else metadata.len;
-
-                            break :blk @Type(.{ .Struct = .{
-                                .layout = .Auto,
-                                .fields = fields[0..index],
-                                .decls = &.{},
-                                .is_tuple = false,
-                            } });
-                        };
-
-                        pub const Result = struct {
-                            bucket: *Bucket,
-                            pointers: Pointers,
-                            len: u16,
-
-                            const Tag = meta.FieldEnum(Pointers);
-
-                            fn Items(comptime com: Tag) type {
-                                const info = @typeInfo(meta.fieldInfo(Pointers, com).field_type).Pointer;
-                                if (info.is_const) {
-                                    return []const info.child;
-                                } else {
-                                    return []info.child;
-                                }
-                            }
-
-                            pub inline fn items(self: Result, comptime com: Tag) Items(com) {
-                                return @field(self.pointers, @tagName(com))[0..self.len];
-                            }
-                        };
-
-                        fn pointers(bucket: *Bucket) Pointers {
-                            var result: Pointers = undefined;
-
-                            var it = bucket.iterator();
-
-                            inline for (metadata) |m| {
-                                const FT = Archetype.TypeOf(m.name.component);
-
-                                if (FT != void) {
-                                    const ptr = it.findNext(m.name.component) orelse unreachable;
-
-                                    const name = comptime m.name.getName(); // stage 1 bug
-                                    @field(result, name) = if (m.mutable)
-                                        @ptrCast([*]FT, @alignCast(@alignOf(FT), ptr))
-                                    else
-                                        @ptrCast([*]const FT, @alignCast(@alignOf(FT), ptr));
-                                }
-                            }
-
-                            return result;
-                        }
-
-                        pub fn next(self: *@This()) ?Result {
-                            var entry = self.it.next() orelse return null;
-
-                            while (!entry.key_ptr.contains(self.type)) {
-                                entry = self.it.next() orelse return null;
-                            }
-
-                            entry.value_ptr.commit(self.map);
-                            return Result{
-                                .bucket = entry.value_ptr,
-                                .pointers = pointers(entry.value_ptr),
-                                .len = entry.value_ptr.len,
-                            };
-                        }
-                    };
-                }
-
-                fn new(self: @This()) Entity {
-                    var count = self.model.count;
-                    defer self.model.count = count;
-
-                    var limit: u32 = 0xffff_ffff;
-
-                    while (self.model.entities.contains(@intToEnum(Entity, count))) : (limit -= 1) {
-                        count += 1;
-                    }
-
-                    return @intToEnum(Entity, count);
-                }
-
-                /// Create a new entity with the given components.
-                pub fn create(
-                    self: @This(),
-                    gpa: Allocator,
-                    comptime T: type,
-                    value: T,
-                ) !Entity {
-                    const entity = self.new();
-                    try self.update(gpa, entity, T, value);
-                    return entity;
-                }
-
-                pub fn update(
-                    self: @This(),
-                    gpa: Allocator,
-                    entity: Entity,
-                    comptime T: type,
-                    values: T,
-                ) !void {
-                    const pointer = blk: {
-                        const entry = try self.model.entities.getOrPut(gpa, entity);
-
-                        if (!entry.found_existing) {
-                            entry.value_ptr.* = .{
-                                .index = undefined,
-                                .type = .empty,
-                            };
-                        }
-
-                        break :blk entry.value_ptr;
-                    };
-
-                    const location = pointer.type.merge(Archetype.fromType(T));
-
-                    if (location == .empty) std.debug.todo("handle zero");
-
-                    const bucket = blk: {
-                        const entry = try self.model.storage.getOrPut(gpa, location);
-
-                        if (!entry.found_existing) {
-                            entry.value_ptr.* = .{
-                                .type = location,
-                            };
-                        }
-
-                        break :blk entry.value_ptr;
-                    };
-
-                    if (pointer.type != location) {
-                        const index = bucket.len;
-                        try bucket.ensureTotalCapacity(gpa, index + 1);
-                        bucket.len += 1;
-
-                        if (pointer.type != .empty) {
-                            const old = self.model.storage.getPtr(pointer.type) orelse unreachable;
-                            old.commit(&self.model.entities);
-
-                            var old_it = old.iterator();
-                            var new_it = bucket.iterator();
-
-                            while (old_it.next()) |old_pair| {
-                                const ptr = new_it.findNext(old_pair.tag) orelse unreachable;
-                                const size = layout.size[@enumToInt(old_pair.tag)];
-
-                                if (size == 0) break; // void tags
-
-                                const old_ptr = old_pair.ptr + size * pointer.index;
-                                const new_ptr = ptr + size * index;
-                                @memcpy(new_ptr, old_ptr, size);
-                            }
-
-                            old.remove(pointer.index);
-                        }
-
-                        bucket.entities()[index] = entity;
-                        pointer.index = index;
-                        pointer.type = location;
-                    }
-
-                    var it = bucket.iterator();
-
-                    inline for (namespace) |m| {
-                        const name = comptime m.getName();
-                        if (@hasField(T, name)) {
-                            const FT = Archetype.TypeOf(m.component);
-
-                            if (FT != void) {
-                                const ptr = it.findNext(m.component) orelse unreachable;
-                                const component = @ptrCast([*]FT, @alignCast(@alignOf(FT), ptr));
-                                component[pointer.index] = @field(
-                                    values,
-                                    name,
-                                );
-                            }
-                        }
-                    }
-                }
+        pub fn iterator(self: *const Self) Iterator {
+            return .{
+                .capacity = self.capacity,
+                .type = self.type.iterator(),
+                .ptr = self.bytes.ptr,
             };
         }
 
-        pub const Bucket = struct {
-            type: Archetype,
-            capacity: u16 = 0,
-            bytes: []u8 = &.{},
-            free: ?Free = null,
-            len: u16 = 0,
+        pub const Iterator = struct {
+            capacity: u16,
+            type: Archetype(Data).Iterator,
+            ptr: [*]u8,
 
-            // -- ACCESS --
+            pub fn next(self: *Iterator) ?Pair {
+                const tag = self.type.next() orelse return null;
+                const index = @enumToInt(tag);
+                const offset = mem.alignForward(@ptrToInt(self.ptr), layout.alignment[index]) -
+                    @ptrToInt(self.ptr);
 
-            pub fn entities(self: Bucket) []Entity {
-                const offset = self.bytes.ptr + (self.bytes.len - @sizeOf(Entity) * self.capacity);
-                return @ptrCast([*]Entity, @alignCast(@alignOf(Entity), offset))[0..self.len];
+                self.ptr += offset;
+
+                defer self.ptr += self.capacity * layout.size[index];
+
+                return Pair{ .tag = tag, .ptr = self.ptr };
             }
 
-            pub fn items(self: Bucket, comptime tag: Archetype.Tag) []Archetype.TypeOf(tag) {
-                assert(self.type.has(tag)); // missing component
-
-                const T = Archetype.TypeOf(tag);
-
-                var offset: usize = 0;
-
-                var it = self.type.iterator();
-                while (it.next()) |found| {
-                    if (found == tag) {
-                        offset = mem.alignForward(offset, layout.alignment[@enumToInt(found)]);
-                        break;
-                    }
-
-                    offset = mem.alignForward(offset, layout.alignment[@enumToInt(found)]) +
-                        layout.size[@enumToInt(found)] * self.capacity;
+            pub fn findNext(self: *Iterator, tag: Archetype(Data).Tag) ?Pair {
+                while (self.next()) |found| {
+                    if (found.tag == tag) return found;
                 }
 
-                const ptr = @alignCast(@alignOf(T), self.bytes.ptr + offset);
-
-                return @ptrCast([*]T, ptr)[0..self.len];
+                return null;
             }
+        };
 
-            pub fn iterator(self: *Bucket) Iterator {
+        pub fn copyBackwardsTo(self: Self, other: Self) void {
+            assert(self.type == other.type);
+            assert(self.bytes.len <= other.bytes.len);
+
+            var si = self.backwardIterator();
+            var oi = other.backwardIterator();
+
+            mem.copyBackwards(Entity, other.entities(), self.entities());
+
+            while (si.next()) |src| {
+                const dst = oi.findNext(src.tag);
+                const len = @as(usize, layout.size[@enumToInt(src.tag)]) * self.len;
+
+                mem.copyBackwards(u8, dst.ptr[0..len], src.ptr[0..len]);
+            }
+        }
+
+        pub fn backwardIterator(self: *const Self) BackwardIterator {
+            if (natural_alignment) {
                 return .{
                     .capacity = self.capacity,
-                    .it = self.type.iterator(),
+                    .offset = @ptrToInt(self.entities().ptr) - @ptrToInt(self.bytes.ptr),
+                    .type = self.type.backwardIterator(),
                     .ptr = self.bytes.ptr,
                 };
             }
+            return .{
+                .capacity = self.capacity,
+                .type = self.type.backwardIterator(),
+                .ptr = self.bytes.ptr,
+            };
+        }
 
-            pub const Iterator = struct {
-                capacity: u16,
-                it: Archetype.Iterator,
-                ptr: [*]u8,
+        pub const Pair = struct {
+            tag: Archetype(Data).Tag,
+            ptr: [*]u8,
+        };
 
-                pub const Pair = struct {
-                    tag: Archetype.Tag,
-                    ptr: [*]u8,
-                };
+        pub const BackwardIterator = if (natural_alignment) struct {
+            capacity: u16,
+            offset: usize,
+            type: Archetype(Data).BackwardIterator,
+            ptr: [*]u8,
 
-                pub fn next(self: *Iterator) ?Pair {
-                    const tag = self.it.next() orelse return null;
-                    self.ptr += mem.alignForward(@ptrToInt(self.ptr), layout.alignment[@enumToInt(tag)]) -
-                        @ptrToInt(self.ptr);
-
-                    defer self.ptr += self.capacity * layout.size[@enumToInt(tag)];
-
-                    return Pair{ .tag = tag, .ptr = self.ptr };
-                }
-
-                pub fn findNext(self: *Iterator, tag: Archetype.Tag) ?[*]u8 {
-                    while (self.next()) |pair| {
-                        if (pair.tag == tag) return pair.ptr;
-                    }
-
+            pub fn next(self: *BackwardIterator) ?Pair {
+                const tag = self.type.next() orelse {
+                    assert(self.offset == 0);
                     return null;
-                }
-            };
-
-            // -- EXPANDING CAPACITY --
-
-            pub fn ensureTotalCapacity(self: *Bucket, gpa: Allocator, new_capacity: u16) !void {
-                var better_capacity = self.capacity;
-                if (better_capacity >= new_capacity) return;
-
-                while (true) {
-                    better_capacity +|= better_capacity / 2 + 8;
-                    if (better_capacity >= new_capacity) break;
-                }
-
-                return self.setCapacity(gpa, better_capacity);
-            }
-
-            pub fn ensureUnusedCapacity(self: *Bucket, gpa: Allocator, additional_capacity: u16) !void {
-                return self.ensureTotalCapacity(gpa, self.len + additional_capacity);
-            }
-
-            pub fn setCapacity(self: *Bucket, gpa: Allocator, new_capacity: u16) !void {
-                assert(new_capacity >= self.len);
-
-                const alignment = layout.alignment[@ctz(Archetype.Int, @enumToInt(self.type))];
-
-                const size = blk: {
-                    var size: usize = 0;
-                    var it = self.type.iterator();
-                    while (it.next()) |tag| {
-                        size = mem.alignForward(size, layout.alignment[@enumToInt(tag)]) +
-                            layout.size[@enumToInt(tag)] * new_capacity;
-                    }
-                    break :blk size;
                 };
 
-                const bytes = mem.alignForward(size, @alignOf(Entity)) +
-                    @sizeOf(Entity) * new_capacity;
+                const index = @enumToInt(tag);
+                self.offset -= layout.size[index] * self.capacity;
 
-                const new_bytes = try gpa.allocBytes(alignment, bytes, 0, @returnAddress());
+                return Pair{ .ptr = self.ptr + self.offset, .tag = tag };
+            }
+        } else struct {
+            capacity: u16,
+            type: Archetype(Data).BackwardIterator,
+            ptr: [*]u8,
 
-                if (self.len == 0) {
-                    gpa.free(self.bytes);
-                    self.bytes = new_bytes;
-                    self.capacity = new_capacity;
-                    return;
-                }
+            pub fn next(self: *BackwardIterator) ?Pair {
+                var tmp: Iterator = .{
+                    .capacity = self.capacity,
+                    .type = self.type.type.iterator(),
+                    .ptr = self.ptr,
+                };
 
-                var bucket = self.*;
-                bucket.bytes = new_bytes;
-                bucket.capacity = new_capacity;
+                const tag = self.type.next() orelse return null;
 
-                var self_it = self.iterator();
-                var new_it = bucket.iterator();
+                return tmp.findNext(tag).?;
+            }
+        };
 
-                while (self_it.next()) |self_pair| {
-                    const new_pair = new_it.next() orelse unreachable;
-                    const len = layout.size[@enumToInt(self_pair.tag)] * self.len;
+        const Free = struct {
+            head: u16 = 0xffff,
+            tail: u16 = 0,
 
-                    @memcpy(new_pair.ptr, self_pair.ptr, len);
-                }
-
-                mem.copy(Entity, bucket.entities(), self.entities());
-
-                gpa.free(self.bytes);
-
-                self.* = bucket;
+            pub fn clear(self: *Free) void {
+                self.* = .{};
             }
 
-            // -- REMOVING --
-
-            const Free = struct {
-                head: u16,
-                tail: u16,
-            };
-
-            const Node = packed struct {
-                next: u16,
-                prev: u16,
-            };
-
-            /// Mark an entity for removal.
-            ///
-            /// Removed entities are turned into a doubly-linked list from the first
-            /// removed entity to the last which leaves a sparse bucket where the
-            /// bucket length no longer matches the actual length of the component
-            /// arrays (it's now sparse). To return to a compact representation see
-            /// `Model.commit`.
-            pub fn remove(self: *Bucket, index: u16) void {
-                assert(index < self.len); // out of bounds
-                const nodes = @ptrCast([*]Node, self.entities().ptr);
-
-                if (self.free) |*list| {
-                    assert(list.tail < index); // wrong order
-
-                    nodes[list.tail].next = index;
-                    nodes[index] = .{
-                        .next = 0,
-                        .prev = list.tail,
-                    };
-
-                    list.tail = index;
-                } else {
-                    nodes[index] = .{
-                        .next = 0,
-                        .prev = 0xffff,
-                    };
-
-                    self.free = .{
-                        .head = index,
-                        .tail = index,
-                    };
-                }
+            pub fn isEmpty(self: Free) bool {
+                return self.head > self.tail;
             }
+        };
 
-            /// Remove marked entities from the component array by swap removal.
-            ///
-            /// Entities are popped from the end of the array to fill spaces left
-            /// by entities marked for removal. Each component array is moved
-            /// separately to avoid having to load several locations at once
-            /// leaving only the entity id array and hopefully the end
-            /// of the component array in cache.
-            pub fn commit(self: *Bucket, map: *const EntityMap) void {
-                const es = self.entities();
-                const nodes = @ptrCast([*]Node, es.ptr);
-                const list = self.free orelse return;
+        const Node = packed struct {
+            next: u16,
+            prev: u16,
+        };
 
-                self.free = null;
+        /// Mark an entity for removal.
+        ///
+        /// Removed entities are turned into a doubly-linked list from the first
+        /// removed entity to the last which leaves a sparse bucket where the
+        /// bucket length no longer matches the actual length of the component
+        /// arrays (it's now sparse). To return to a compact representation see
+        /// `Model.commit`.
+        pub fn remove(self: *Bucket, index: u16) void {
+            assert(index < self.len); // out of bounds
+            const nodes = @ptrCast([*]Node, self.entities().ptr);
 
-                var newlen: u16 = self.len;
-                var span: Free = list;
-                var limit: u16 = newlen;
+            if (!self.free.isEmpty()) {
+                assert(self.free.tail < index); // wrong order
 
-                var it = self.iterator();
-                while (it.next()) |pair| {
-                    span = list;
-                    newlen = self.len;
+                nodes[self.free.tail].next = index;
+                nodes[index] = .{
+                    .next = 0,
+                    .prev = self.free.tail,
+                };
 
-                    loop: while (true) {
-                        while (span.tail >= newlen) {
-                            if (newlen == 0) break :loop;
-                            const prev = nodes[span.tail].prev;
-                            if (prev == 0xffff) break :loop;
-                            span.tail = prev;
-                        }
+                self.free.tail = index;
+            } else {
+                nodes[index] = .{
+                    .next = 0,
+                    .prev = 0xffff,
+                };
 
-                        const size = layout.size[@enumToInt(pair.tag)];
-                        const dst = pair.ptr + span.head * size;
-                        const src = pair.ptr + (newlen - 1) * size;
+                self.free = .{
+                    .head = index,
+                    .tail = index,
+                };
+            }
+        }
 
-                        @memcpy(dst, src, size);
+        /// Remove marked entities from the component array by swap removal.
+        ///
+        /// Entities are popped from the end of the array to fill spaces left
+        /// by entities marked for removal. Each component array is moved
+        /// separately to avoid having to load several locations at once
+        /// leaving only the entity id array and hopefully the end
+        /// of the component array in cache.
+        pub fn commit(self: *Self, comptime Map: type, map: *const Map) void {
+            const es = self.entities();
+            const nodes = @ptrCast([*]Node, es.ptr);
 
-                        const next = nodes[span.head].next;
-                        span.head = next;
+            if (self.free.isEmpty()) return;
 
-                        newlen -= 1;
+            const list = self.free;
 
-                        if (next == 0) break;
-                    }
-                }
+            self.free.clear();
 
-                newlen = self.len;
+            var newlen: u16 = self.len;
+            var span: Free = list;
+            var limit: u16 = newlen;
+
+            var it = self.iterator();
+            while (it.next()) |pair| {
                 span = list;
+                newlen = self.len;
 
-                loop: while (newlen > 0) : (limit -= 1) {
+                loop: while (true) {
                     while (span.tail >= newlen) {
                         if (newlen == 0) break :loop;
                         const prev = nodes[span.tail].prev;
@@ -903,250 +578,383 @@ pub fn Model(comptime Spec: type) type {
                         span.tail = prev;
                     }
 
-                    const index = span.head;
-                    const next = nodes[index].next;
-                    es[index] = es[newlen - 1];
+                    const size: usize = layout.size[@enumToInt(pair.tag)];
+                    const dst = pair.ptr + span.head * size;
+                    const src = pair.ptr + (newlen - 1) * size;
 
-                    if (index != newlen - 1) {
-                        const pointer = map.getPtr(es[index]).?;
-                        pointer.index = index;
-                    }
+                    @memcpy(dst, src, size);
 
+                    const next = nodes[span.head].next;
                     span.head = next;
 
                     newlen -= 1;
 
                     if (next == 0) break;
                 }
-
-                self.len = newlen;
             }
 
-            // -- DEINIT --
+            newlen = self.len;
+            span = list;
 
-            pub fn deinit(self: *Bucket, gpa: Allocator) void {
-                gpa.free(self.bytes);
-                self.* = undefined;
+            loop: while (newlen > 0) : (limit -= 1) {
+                while (span.tail >= newlen) {
+                    if (newlen == 0) break :loop;
+                    const prev = nodes[span.tail].prev;
+                    if (prev == 0xffff) break :loop;
+                    span.tail = prev;
+                }
+
+                const index = span.head;
+                const next = nodes[index].next;
+                es[index] = es[newlen - 1];
+
+                if (index != newlen - 1) {
+                    const pointer = map.getPtr(es[index]).?;
+                    pointer.index = index;
+                }
+
+                span.head = next;
+
+                newlen -= 1;
+
+                if (next == 0) break;
             }
+
+            self.len = newlen;
+        }
+    };
+}
+
+test "Bucket.iterator" {
+    const Data = struct { x: u32, y: f32, z: u8, w: u128 };
+
+    const archetype = comptime Archetype(Data).fromType(Data);
+
+    const size = comptime Bucket(Data).sizeOf(archetype, 32);
+    const alignment = comptime Bucket(Data).alignment(archetype);
+    var backing: [size]u8 align(alignment) = undefined;
+
+    var a: Bucket(Data) = .{
+        .type = archetype,
+        .bytes = &backing,
+        .capacity = 32,
+    };
+
+    const w = 0;
+    const x = @sizeOf(u128) * 32;
+    const y = x + @sizeOf(u32) * 32;
+    const z = y + @sizeOf(f32) * 32;
+
+    const base = @ptrToInt(&backing);
+
+    var it = a.iterator();
+    for ([_]usize{ w, x, y, z }) |offset| {
+        const found = it.next().?;
+
+        try testing.expectEqual(offset, @ptrToInt(found.ptr) - base);
+    }
+
+    var bi = a.backwardIterator();
+    for ([_]usize{ z, y, x, w }) |offset| {
+        const found = bi.next().?;
+
+        try testing.expectEqual(offset, @ptrToInt(found.ptr) - base);
+    }
+}
+
+test "Bucket.iterator alignment" {
+    const Data = struct {
+        x: u32 align(8),
+        y: f32 align(8),
+        z: u8,
+    };
+
+    const archetype = comptime Archetype(Data).fromType(Data);
+
+    const size = comptime Bucket(Data).sizeOf(archetype, 31);
+    const alignment = comptime Bucket(Data).alignment(archetype);
+    var backing: [size]u8 align(alignment) = undefined;
+
+    var a: Bucket(Data) = .{
+        .type = archetype,
+        .bytes = &backing,
+        .capacity = 31,
+    };
+
+    const x = 0;
+    const y = 4 + @sizeOf(u32) * 31;
+    const z = y + @sizeOf(f32) * 31;
+
+    const base = @ptrToInt(&backing);
+
+    var bi = a.backwardIterator();
+    for ([_]usize{ z, y, x }) |offset| {
+        const found = bi.next().?;
+
+        try testing.expectEqual(offset, @ptrToInt(found.ptr) - base);
+    }
+}
+
+pub fn Model(comptime Data: type) type {
+    const layout = Decompose(Data);
+    return struct {
+        entities: EntityMap = .{},
+        buckets: BucketMap = .{},
+        count: u32 = 0,
+
+        pub const EntityMap = std.hash_map.AutoHashMapUnmanaged(Entity, Pointer);
+        pub const BucketMap = std.hash_map.AutoHashMapUnmanaged(Archetype(Data), Bucket(Data));
+        pub const Pointer = struct {
+            index: u16,
+            type: Archetype(Data),
         };
 
-        // -- DEINIT --
+        const Self = @This();
+
+        pub const CreateError = error{
+            /// Failed to allocate memory for the entity hashmap.
+            OutOfMemory,
+            /// Missing bucket for the given archetype.
+            MissingBucket,
+            /// Bucket has reached it's capacity limits.
+            Capacity,
+            /// Ouf of slots.
+            OutOfEntitySlots,
+        };
+
+        /// Create a new `Entity`.
+        pub fn create(self: *Self, gpa: Allocator, comptime T: type, value: T) CreateError!Entity {
+            var limit: u32 = 0;
+            var count: u32 = self.count;
+            defer self.count = count;
+
+            while (true) {
+                const entity = @intToEnum(Entity, count);
+
+                if (self.entities.contains(entity)) {
+                    limit += 1;
+                    count +%= 1;
+                    if (limit == 0xffff) break;
+                    continue;
+                }
+
+                const archetype = Archetype(Data).fromType(T);
+                const target = self.buckets.getPtr(archetype) orelse return error.MissingBucket;
+
+                const index = try target.push(1);
+                errdefer target.len -= 1;
+
+                try self.entities.put(gpa, entity, .{
+                    .index = index,
+                    .type = archetype,
+                });
+
+                target.entities()[index] = entity;
+
+                var it = target.iterator();
+
+                inline for (layout.fields) |field| {
+                    if (@hasField(T, field.name)) {
+                        const tag = @field(Archetype(Data).Tag, field.name);
+                        const size: usize = comptime layout.size[@enumToInt(tag)];
+
+                        const dst = it.findNext(tag).?;
+                        const offset = index * size;
+
+                        @memcpy(dst.ptr + offset, mem.asBytes(&@field(value, field.name)), size);
+                    }
+                }
+
+                return entity;
+            }
+
+            return error.OutOfEntitySlots; // 4GiB of just entity ids? really?
+        }
+
+        pub const UpdateError = error{
+            /// Missing bucket for the given archetype.
+            MissingBucket,
+            /// The target Bucket has reached it's capacity limits.
+            Capacity,
+        };
+
+        pub const RegisterError = error{
+            OutOfMemory,
+        };
+
+        pub fn register(self: *Self, gpa: Allocator, bucket: Bucket(Data)) RegisterError!void {
+            try self.buckets.putNoClobber(gpa, bucket.type, bucket);
+        }
+
+        pub fn update(self: Self, entity: Entity, comptime T: type, value: T) UpdateError!void {
+            const pointer = self.entities.getPtr(entity).?;
+            const archetype = pointer.type.merge(Archetype(Data).TypeOf(T));
+            const target = self.buckets.getPtr(archetype) orelse return error.MissingBucket;
+
+            if (archetype != pointer.type) {
+                const origin = self.buckets.getPtr(pointer.type).?;
+                const index = try target.push(1);
+
+                origin.move(index, target, pointer.index);
+
+                pointer.index = index;
+                pointer.type = archetype;
+            }
+
+            var it = target.iterator();
+
+            inline for (layout.fields) |field| {
+                if (@hasField(T, field.name) and @sizeOf(field.field_type) != 0) {
+                    const tag = @field(Archetype(Data).Tag, field.name);
+                    const size: usize = comptime layout.size[@enumToInt(tag)];
+
+                    const dst = it.findNext(tag).?;
+                    const offset = pointer.index * size;
+
+                    @memcpy(dst.ptr + offset, &@field(value, field.name), size);
+                }
+            }
+        }
+
+        pub fn query(self: *Self, comptime spec: type) Query(spec) {
+            return .{
+                .model = self,
+                .buckets = self.buckets.iterator(),
+            };
+        }
+
+        pub fn Query(comptime spec: type) type {
+            return struct {
+                model: *Self,
+                buckets: BucketMap.Iterator,
+
+                const archetype = Archetype(Data).fromType(spec);
+
+                pub const Result = struct {
+                    bucket: *Bucket(Data),
+                    ptr: Pointers,
+                    len: u16,
+
+                    const Tag = meta.FieldEnum(Pointers);
+
+                    fn Item(comptime com: Tag) type {
+                        const info = @typeInfo(meta.fieldInfo(Pointers, com).field_type).Pointer;
+                        if (info.is_const) {
+                            return []const info.child;
+                        } else {
+                            return []info.child;
+                        }
+                    }
+
+                    pub inline fn items(self: Result, comptime com: Tag) Item(com) {
+                        return @field(self.ptr, @tagName(com))[0..self.len];
+                    }
+
+                    pub const Pointers = blk: {
+                        var fields: [layout.fields.len]Type.StructField = undefined;
+                        var result: spec = undefined;
+
+                        var index: u16 = 0;
+                        for (layout.fields) |field| {
+                            if (@hasField(spec, field.name)) {
+                                const T = @TypeOf(@field(result, field.name));
+                                fields[index] = field;
+                                if (T == field.field_type) {
+                                    fields[index].field_type = [*]const field.field_type;
+                                } else if (T == *field.field_type) {
+                                    fields[index].field_type = [*]field.field_type;
+                                } else @compileError("");
+                                index += 1;
+                            }
+                        }
+
+                        break :blk @Type(.{ .Struct = .{
+                            .layout = .Auto,
+                            .fields = fields[0..index],
+                            .decls = &.{},
+                            .is_tuple = false,
+                        } });
+                    };
+                };
+
+                fn pointers(bucket: *Bucket(Data)) Result.Pointers {
+                    var result: Result.Pointers = undefined;
+
+                    var it = bucket.iterator();
+
+                    inline for (meta.fields(Result.Pointers)) |field| {
+                        const tag = @field(Archetype(Data).Tag, field.name);
+                        const alignment = @alignOf(Archetype(Data).TypeOf(tag));
+                        const src = it.findNext(tag).?;
+                        @field(result, field.name) = @ptrCast(field.field_type, @alignCast(alignment, src.ptr));
+                    }
+
+                    return result;
+                }
+
+                pub fn next(self: *@This()) ?Result {
+                    var bucket = self.buckets.next() orelse return null;
+
+                    while (!bucket.key_ptr.contains(archetype)) {
+                        bucket = self.buckets.next() orelse return null;
+                    }
+
+                    const p = pointers(bucket.value_ptr);
+                    bucket.value_ptr.commit(EntityMap, &self.model.entities);
+
+                    return Result{
+                        .bucket = bucket.value_ptr,
+                        .ptr = p,
+                        .len = bucket.value_ptr.len,
+                    };
+                }
+            };
+        }
 
         pub fn deinit(self: *Self, gpa: Allocator) void {
             self.entities.deinit(gpa);
-
-            var it = self.storage.valueIterator();
-            while (it.next()) |bucket| bucket.deinit(gpa);
-            self.storage.deinit(testing.allocator);
+            self.buckets.deinit(gpa);
         }
-
-        // -- private --
-
-        const layout = blk: {
-            const tmp = meta.fields(Spec);
-
-            var fields = tmp[0..tmp.len].*;
-            var alignment: [tmp.len]u8 = undefined;
-            var size: [tmp.len]u8 = undefined;
-            var set: [tmp.len]Type.EnumField = undefined;
-            var split: u16 = 0;
-
-            std.sort.sort(Type.StructField, &fields, {}, struct {
-                pub fn lessThan(_: void, comptime lhs: Type.StructField, comptime rhs: Type.StructField) bool {
-                    const al = @maximum(@sizeOf(lhs.field_type), lhs.alignment);
-                    const ar = @maximum(@sizeOf(rhs.field_type), rhs.alignment);
-                    return al > ar;
-                }
-            }.lessThan);
-
-            for (fields) |field, index| {
-                if (@sizeOf(field.field_type) > 0) {
-                    alignment[index] =
-                        @maximum(@sizeOf(field.field_type), field.alignment);
-                    split = index;
-                } else {
-                    if (field.field_type != void) {
-                        @compileError("0-bit other than `void` (tags) aren't supported as component types");
-                    }
-                    alignment[index] = 0;
-                }
-
-                size[index] = @sizeOf(field.field_type);
-                set[index] = .{
-                    .name = field.name,
-                    .value = index,
-                };
-            }
-
-            split += 1;
-
-            const Tag = @Type(.{ .Enum = .{
-                .layout = .Auto,
-                .fields = &set,
-                .decls = &.{},
-                .is_exhaustive = true,
-                .tag_type = math.IntFittingRange(0, fields.len - 1),
-            } });
-
-            break :blk .{
-                .fields = fields,
-                .alignment = alignment,
-                .size = size,
-                .tag = Tag,
-                .split = @as(comptime_int, split),
-            };
-        };
     };
 }
 
-test "alias" {
-    const Data = struct {
-        x: u32,
+test "Model.query" {
+    const Data = struct { x: u32, y: f32, z: u8, w: u128 };
+    const Subset = struct { x: u32, y: f32 };
+
+    var model: Model(Data) = .{};
+    defer model.entities.deinit(testing.allocator);
+    defer model.buckets.deinit(testing.allocator);
+
+    const archetype = comptime Archetype(Data).fromType(Subset);
+    const size = comptime Bucket(Data).sizeOf(archetype, 32); // entries
+    const alignment = comptime Bucket(Data).alignment(archetype); // required alignment
+
+    var backing: [size]u8 align(alignment) = undefined;
+
+    var bucket = .{
+        .type = archetype,
+        .bytes = &backing,
+        .capacity = 32,
     };
 
-    const DB = Model(Data);
+    try model.buckets.put(testing.allocator, bucket.type, bucket);
 
-    var db: DB = .{};
-    defer db.deinit(testing.allocator);
+    const entity = try model.create(testing.allocator, Subset, .{
+        .x = 42,
+        .y = 0.42,
+    });
 
-    const ctx = db.context(&.{});
-
-    const e = ctx.new();
-
-    try ctx.update(testing.allocator, e, struct { x: u32 = 4 }, .{});
-
-    var it = ctx.query(struct { x: *u32 });
-
-    while (it.next()) |result| {
-        for (result.items(.x)) |x| try testing.expectEqual(@as(u32, 4), x);
-    }
-
-    const otx = db.context(&.{.{ .component = .x, .name = .foo }});
-
-    var itt = otx.query(struct { foo: u32 });
-
-    while (itt.next()) |result| {
-        for (result.items(.foo)) |x| try testing.expectEqual(@as(u32, 4), x);
-    }
-}
-
-test "migrate entities" {
-    const Data = struct {
-        x: u32,
-        y: u8,
-    };
-
-    const DB = Model(Data);
-
-    var db: DB = .{};
-    defer db.deinit(testing.allocator);
-
-    const default = db.context(&.{});
-
-    var es: [8]Entity = undefined;
-
-    for (es) |*e, index| {
-        e.* = try default.create(testing.allocator, struct { x: u32 }, .{
-            .x = @intCast(u32, index + 8),
-        });
-    }
-
-    for (es[4..]) |e, index| {
-        try default.update(testing.allocator, e, struct { y: u8 }, .{
-            .y = @intCast(u8, index + 8),
-        });
-    }
-
-    var it = default.query(struct { x: u32 });
-    while (it.next()) |result| {
-        try testing.expectEqual(@as(usize, 4), result.bucket.len);
-
-        if (result.bucket.type.has(.y)) {
-            try testing.expectEqualSlices(u32, &.{ 12, 13, 14, 15 }, result.items(.x));
-            try testing.expectEqualSlices(u8, &.{ 8, 9, 10, 11 }, result.bucket.items(.y));
-        } else {
-            try testing.expectEqualSlices(u32, &.{ 8, 9, 10, 11 }, result.items(.x));
-        }
-    }
-
-    for (es) |e, index| {
-        const pointer = db.entities.get(e).?;
-        const bucket = db.storage.getPtr(pointer.type).?;
-        const value = bucket.items(.x)[pointer.index];
-        try testing.expectEqual(@intCast(u32, index + 8), value);
-
-        if (pointer.type.has(.y)) {
-            const small = bucket.items(.y)[pointer.index];
-            try testing.expectEqual(@intCast(u8, index + 4), small);
-        }
-    }
-}
-
-test "simd alignment" {
-    const Data = struct {
-        position: Vec3 align(16),
-        velocity: Vec3 align(16),
-
-        pub const Vec3 = extern struct { x: f32, y: f32, z: f32 };
-    };
-
-    const DB = Model(Data);
-
-    var db: DB = .{};
-    defer db.deinit(testing.allocator);
-
-    const default = db.context(&.{});
-
-    var es: [32]Entity = undefined;
-
-    for (es) |*e, index| {
-        const i = 1 / @intToFloat(f32, index);
-
-        const point = .{ .x = i, .y = i, .z = i };
-
-        e.* = try default.create(testing.allocator, Data, .{
-            .position = point,
-            .velocity = point,
-        });
-    }
-
-    var it = default.query(struct {
-        position: *Data.Vec3,
-        velocity: Data.Vec3,
+    var it = model.query(struct {
+        x: *u32,
+        y: f32,
     });
 
     while (it.next()) |result| {
-        const p = result.pointers;
-
-        const f32x8 = @Vector(8, f32);
-
-        var pos = @ptrCast([*]f32, p.position);
-        var vel = @ptrCast([*]const f32, p.velocity);
-        const len = result.bucket.len * 3;
-
-        try testing.expect(mem.alignForward(@ptrToInt(pos), 16) - @ptrToInt(pos) == 0);
-        try testing.expect(mem.alignForward(@ptrToInt(vel), 16) - @ptrToInt(vel) == 0);
-
-        var index: u16 = 0;
-        while (len - index > 8) : (index += 8) {
-            pos[0..8].* = @as(f32x8, pos[0..8].*) + @as(f32x8, vel[0..8].*);
-
-            pos += 8;
-            vel += 8;
+        for (result.ptr.y[0..result.bucket.len]) |y, i| {
+            _ = y;
+            result.ptr.x[i] = 32;
+            try testing.expectEqual(entity, result.bucket.entities()[i]);
         }
-
-        for (vel[0 .. len - index]) |v, i| pos[i] += v;
-    }
-
-    const bucket = db.storage.getPtr(DB.Archetype.fromType(Data)).?;
-    const pos = bucket.items(.position);
-    const vel = bucket.items(.velocity);
-
-    for (pos) |p, index| {
-        const v = vel[index];
-
-        try testing.expectApproxEqAbs(p.x, v.x + v.x, 0.00001);
-        try testing.expectApproxEqAbs(p.y, v.y + v.y, 0.00001);
-        try testing.expectApproxEqAbs(p.z, v.z + v.z, 0.00001);
     }
 }
